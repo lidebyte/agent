@@ -474,12 +474,16 @@ fn addresses() -> (String, String) {
 /// overlay behind it. WireGuard is the exception for a public v6, since a
 /// machine without IPv6 of its own gets a routed prefix through one. VPN
 /// clients' own addresses are private, CGNAT or ULA, which [`is_public`]
-/// rejects. Cloudflare WARP is the one that is not: `wgcf` puts a global
+/// rejects. Cloudflare WARP is the one that is not: it puts a global
 /// 2606:4700::/32 address on the tunnel, shared by every user of the service
-/// and not reachable from outside, so that range is left out.
+/// and not reachable from outside. That range is left out on every interface,
+/// whatever the script setting up the tunnel named it -- `wgcf`, `warp`,
+/// `CloudflareWARP` -- since only Cloudflare's own machines hold it natively.
 fn lends_address(name: &str, ip: IpAddr) -> bool {
-    let routed = |v6: Ipv6Addr| is_public(ip) && v6.segments()[..2] != [0x2606, 0x4700];
-    !skip_iface(name) || (name.starts_with("wg") && matches!(ip, IpAddr::V6(v6) if routed(v6)))
+    match ip {
+        IpAddr::V6(v6) if v6.segments()[..2] == [0x2606, 0x4700] => false,
+        _ => !skip_iface(name) || (name.starts_with("wg") && ip.is_ipv6() && is_public(ip)),
+    }
 }
 
 /// A public address before any other, then a stable v6 before a transient
@@ -667,8 +671,13 @@ fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
 }
 
 fn parse_mounts(text: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    let mut out = Vec::new();
+    real_mounts(text).into_iter().map(|(_, mount)| mount).collect()
+}
+
+/// [`parse_mounts`] with the key each point was deduplicated by: the source
+/// device, or a ZFS pool.
+fn real_mounts(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     let rows = mount_rows(text);
     // The table is in mount order and a path resolves to the last mount on it,
     // which is what statvfs below answers for. An earlier entry for the same
@@ -688,12 +697,11 @@ fn parse_mounts(text: &str) -> Vec<String> {
             continue;
         }
         // ZFS datasets and btrfs subvolumes share one pool's free space.
-        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev).to_owned();
-        if seen.contains(&key) {
+        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev);
+        if out.iter().any(|(k, _)| k == key) {
             continue;
         }
-        seen.push(key);
-        out.push(mount.replace("\\040", " "));
+        out.push((key.to_owned(), mount.replace("\\040", " ")));
     }
     out
 }
@@ -704,8 +712,8 @@ fn parse_mounts(text: &str) -> Vec<String> {
 ///
 /// The `install.sh` unit sets `ProtectHome=yes`, which mounts a tmpfs over
 /// /home. Where /home is its own filesystem, `df` on the host and the panel then
-/// disagree by its entire size. Reported once at startup, since the discrepancy
-/// is otherwise visible only in the totals themselves.
+/// disagree by its entire size. Reported at startup in place of
+/// [`hidden_mounts`] where PID 1's table cannot be read.
 pub fn shadowed_mounts(text: &str) -> Vec<String> {
     let rows = mount_rows(text);
     rows.iter()
@@ -719,6 +727,28 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
                     .is_some_and(|(_, _, top)| skip_fstype(top))
         })
         .map(|(_, (_, mount, _))| mount.replace("\\040", " "))
+        .collect()
+}
+
+/// Real filesystems the host mounts that this mount namespace cannot reach,
+/// given the tables of PID 1 and of this process. `ProtectHome=yes` drops every
+/// mount beneath /root and /home from the agent's namespace and covers a
+/// separate /home, so `df` as root counts disks the agent never sees. Compared
+/// by device, so a disk hidden at one point and reachable at another counts as
+/// reachable.
+pub fn hidden_mounts(host: &str, own: &str) -> Vec<String> {
+    let reachable: Vec<String> = real_mounts(own).into_iter().map(|(dev, _)| dev).collect();
+    real_mounts(host).into_iter().filter(|(dev, _)| !reachable.contains(dev)).map(|(_, m)| m).collect()
+}
+
+/// Mount points in this namespace that `statvfs` refuses, with the reason,
+/// which [`disk_usage`] skips while `df` as root counts them: under the
+/// `install.sh` unit the agent runs as its own user, so a disk mounted below a
+/// directory closed to other users is one of these.
+pub fn unreadable_mounts(text: &str) -> Vec<(String, rustix::io::Errno)> {
+    parse_mounts(text)
+        .into_iter()
+        .filter_map(|m| rustix::fs::statvfs(m.as_str()).err().map(|e| (m, e)))
         .collect()
 }
 
@@ -1439,10 +1469,12 @@ mod tests {
         assert!(!lends_address("wg0", ip("203.0.113.9")), "only v6 is asked of a tunnel");
         assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
         assert!(!lends_address("wg0", ip("fd00::2")));
-        assert!(!lends_address("wgcf", ip("2606:4700:110:8a36::1")), "WARP's shared address");
         assert!(!lends_address("docker0", ip("2001:db8::1")), "a bridge's prefix belongs to its guests");
         assert!(!lends_address("tailscale0", ip("2001:db8::2")));
-        assert!(lends_address("eth0", ip("2606:4700:110:8a36::1")), "the range is left out only on a tunnel");
+        for name in ["wgcf", "warp", "CloudflareWARP"] {
+            assert!(!lends_address(name, ip("2606:4700:110:8a36::1")), "WARP's shared address under {name}");
+        }
+        assert!(lends_address("warp", ip("2001:db8::3")), "only the range is left out, not the name");
 
         // What `addresses` makes of a machine with a private v4 and a v6 only
         // through WireGuard.
@@ -1549,6 +1581,14 @@ mod tests {
         assert_eq!(shadowed_mounts(table), vec!["/home"]);
         // A point mounted once is not shadowed, however many others exist.
         assert!(shadowed_mounts("/dev/vda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n").is_empty());
+        // What ProtectHome leaves of the host's table: /home covered, mounts
+        // beneath /root and /home gone, /dev/vdd1 still reachable at /srv.
+        let host = "/dev/vda1 / ext4 rw 0 0\n/dev/vdb1 /home ext4 rw 0 0\n/dev/vdc1 /home/data ext4 rw 0 0\n\
+                    /dev/vdd1 /root/backup ext4 rw 0 0\n/dev/vdd1 /srv ext4 rw 0 0\n";
+        let own = "/dev/vda1 / ext4 rw 0 0\n/dev/vdb1 /home ext4 rw 0 0\ntmpfs /home tmpfs ro 0 0\n\
+                   tmpfs /root tmpfs ro 0 0\n/dev/vdd1 /srv ext4 rw 0 0\n";
+        assert_eq!(hidden_mounts(host, own), ["/home", "/home/data"]);
+        assert!(hidden_mounts(host, host).is_empty(), "the same namespace hides nothing");
     }
 
     #[test]
@@ -1574,6 +1614,22 @@ mod tests {
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
+        assert!(m.uptime > 0 && m.procs > 1, "uptime {} s, {} processes", m.uptime, m.procs);
+        // Every core kept busy between two samples: idle time read as busy
+        // would show under half.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        std::thread::scope(|s| {
+            for _ in 0..cores {
+                s.spawn(|| {
+                    let spin = std::time::Instant::now();
+                    while spin.elapsed() < std::time::Duration::from_millis(300) {
+                        std::hint::black_box(0u64);
+                    }
+                });
+            }
+        });
+        let busy = c.collect().cpu;
+        assert!(busy > 50.0, "{busy}% with every core busy");
     }
 }
 
