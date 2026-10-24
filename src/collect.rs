@@ -1131,6 +1131,26 @@ fn platform_hypervisor() -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// A path under the temp directory, cleared of whatever a killed run under
+    /// the same PID left there, and removed with everything in it when dropped,
+    /// so a failing test leaves nothing behind either. A mutation run fails
+    /// thousands of them.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("monitor-agent-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn memory_matches_free_not_sysinfo() {
         // Real /proc/meminfo from a 3.8 GiB host holding 2.5 GiB of cache.
@@ -1305,9 +1325,8 @@ mod tests {
     /// master but is no bridge's port.
     #[test]
     fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
-        let sys = std::env::temp_dir().join(format!("monitor-agent-sys-{}", std::process::id()));
-        // Left behind by a failed run under a reused PID.
-        let _ = fs::remove_dir_all(&sys);
+        let tmp = TempDir::new("sys");
+        let sys = tmp.0.clone();
         for (name, ty, extra) in [
             ("he-ipv6", 776, &[][..]),
             ("nebula1", 65534, &[]),
@@ -1344,7 +1363,6 @@ mod tests {
         for name in ["wwan0", "venet0", "mv0", "eth0", "eno1", "up1", "absent0"] {
             assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
         }
-        fs::remove_dir_all(&sys).unwrap();
     }
 
     /// Each kind of container as an unprivileged process sees it. The host of
@@ -1352,7 +1370,8 @@ mod tests {
     /// LXCFS mounted outside /proc -- and is no container.
     #[test]
     fn a_container_is_named_from_what_an_unprivileged_process_can_read() {
-        let root = std::env::temp_dir().join(format!("monitor-agent-root-{}", std::process::id()));
+        let tmp = TempDir::new("root");
+        let root = tmp.0.clone();
         let lxcfs = "lxcfs /proc/meminfo fuse.lxcfs rw,nosuid,nodev 0 0\n";
         let lxcfs_host = "lxcfs /var/lib/lxcfs fuse.lxcfs rw,nosuid,nodev 0 0\n";
         for (files, mounts, expected) in [
@@ -1365,7 +1384,7 @@ mod tests {
             (&[], lxcfs_host, None),
             (&[], "", None),
         ] {
-            // Left behind by a failed run under a reused PID, or by the last case.
+            // Left behind by the last case.
             let _ = fs::remove_dir_all(&root);
             for file in files {
                 let (path, content) = file.split_once('=').unwrap_or((file, ""));
@@ -1374,7 +1393,6 @@ mod tests {
             }
             assert_eq!(container(&root, mounts).as_deref(), expected, "{files:?} {mounts:?}");
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A router forwards each byte across two real NICs, so only its owner can
